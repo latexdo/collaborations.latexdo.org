@@ -3,8 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "npm --prefix cloudflare ci && npm --prefix cloudflare run typecheck",
     "dev": "npm --prefix cloudflare run dev",
-    "deploy": "npm --prefix cloudflare run deploy",
+    "deploy": "npx wrangler deploy",
     "typecheck": "npm --prefix cloudflare run typecheck"
+  },
+  "devDependencies": {
+    "wrangler": "^4.110.0"
   }
 }
