@@ -1,0 +1,10 @@
+{
+  "name": "collaborations-latexdo-org",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm --prefix cloudflare run dev",
+    "deploy": "npm --prefix cloudflare run deploy",
+    "typecheck": "npm --prefix cloudflare run typecheck"
+  }
+}
