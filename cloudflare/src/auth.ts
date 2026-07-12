@@ -25,7 +25,7 @@ export function identityFromRequest(request: Request): RequestIdentity {
     ),
     clientName: safeHeaderValue(
       request.headers.get("x-latexdo-client-name") ?? url.searchParams.get("name"),
-      "LatexDo collaborator",
+      "",
     ).slice(0, 80),
     shareToken:
       request.headers.get("x-latexdo-share-token")?.trim() ||
@@ -48,7 +48,7 @@ export function corsHeaders(request: Request, env: Env): HeadersInit {
 
   return {
     "access-control-allow-origin": allowOrigin,
-    "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
     "access-control-allow-headers":
       "content-type,x-latexdo-session,x-latexdo-client,x-latexdo-client-name,x-latexdo-share-token",
     "access-control-max-age": "86400",

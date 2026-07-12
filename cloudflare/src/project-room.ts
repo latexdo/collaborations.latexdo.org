@@ -12,11 +12,14 @@ import {
 import { createShareToken } from "./tokens";
 import type {
   CollaborationState,
+  CollaboratorPermission,
+  CollaboratorRole,
   CreateEntryInput,
   Env,
   InitProjectInput,
   MoveEntryInput,
   OpenProject,
+  PermissionUpdateInput,
   PresenceInput,
   ProjectAccess,
   ProjectEntry,
@@ -29,12 +32,16 @@ const messageAwareness = 1;
 const messageQueryAwareness = 3;
 const yTextName = "content";
 const presenceTtlMs = 45_000;
+const defaultShareRole: CollaboratorRole = "editor";
+const roles: CollaboratorRole[] = ["admin", "editor", "viewer"];
 
 interface ProjectMeta {
   projectId: string;
   name: string;
   ownerSessionId: string;
+  ownerClientId?: string;
   shareToken?: string;
+  defaultRole?: CollaboratorRole;
 }
 
 interface FileRow extends Record<string, SqlStorageValue> {
@@ -42,6 +49,16 @@ interface FileRow extends Record<string, SqlStorageValue> {
   type: "file" | "directory";
   content: string;
   y_update: string | null;
+}
+
+interface CollaboratorRow extends Record<string, SqlStorageValue> {
+  client_id: string;
+  session_id: string;
+  name: string;
+  role: CollaboratorRole;
+  joined_at: number;
+  last_seen: number;
+  revoked: number;
 }
 
 type AttachmentWebSocket = WebSocket & {
@@ -79,6 +96,32 @@ function safeJsonParse<T>(value: string | null): T | null {
   }
 }
 
+function isCollaboratorRole(value: unknown): value is CollaboratorRole {
+  return roles.includes(value as CollaboratorRole);
+}
+
+function canEditContent(role: CollaboratorRole): boolean {
+  return role === "admin" || role === "editor";
+}
+
+function canManageProject(role: CollaboratorRole): boolean {
+  return role === "admin";
+}
+
+function anonymousName(clientId: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < clientId.length; index += 1) {
+    hash ^= clientId.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `Anonymous ${hash.toString(36).toUpperCase().slice(0, 6)}`;
+}
+
+function displayName(identity: RequestIdentity): string {
+  const trimmed = identity.clientName.trim().replace(/\s+/g, " ").slice(0, 80);
+  return trimmed || anonymousName(identity.clientId);
+}
+
 function cfSocket(socket: WebSocket): AttachmentWebSocket {
   return socket as AttachmentWebSocket;
 }
@@ -104,9 +147,12 @@ export class ProjectRoom extends DurableObject<Env> {
       projectId: input.projectId,
       name: input.name.trim().slice(0, 120) || "LatexDo Project",
       ownerSessionId: input.identity.sessionId,
+      ownerClientId: input.identity.clientId,
+      defaultRole: defaultShareRole,
     };
 
     this.setMeta("project", meta);
+    this.upsertCollaborator(input.identity, "admin", true);
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO files (path, type, content, updated_at) VALUES (?, 'file', ?, ?)",
       "main.tex",
@@ -143,8 +189,12 @@ export class ProjectRoom extends DurableObject<Env> {
   async writeFile(
     access: ProjectAccess & { relativePath: string; content: string },
   ): Promise<void> {
-    this.requireExistingAccess(access.identity);
+    const meta = this.requireExistingRole(access.identity, canEditContent, "This project is read-only for you.");
+    const role = this.roleForIdentity(access.identity, meta);
     const path = normalizeRelativePath(access.relativePath);
+    if (!canManageProject(role) && !this.fileRow(path)) {
+      throw new Error("Only admins can create files.");
+    }
     const content = String(access.content ?? "");
     this.writeFileContent(path, content);
 
@@ -171,7 +221,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   async createEntry(input: CreateEntryInput): Promise<{ relativePath: string }> {
-    this.requireExistingAccess(input.identity);
+    this.requireExistingRole(input.identity, canManageProject, "Only admins can create files or folders.");
     const path = normalizeRelativePath(input.relativePath);
     const type = input.type;
     const exists = this.ctx.storage.sql
@@ -193,7 +243,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   async moveEntry(input: MoveEntryInput): Promise<{ relativePath: string }> {
-    this.requireExistingAccess(input.identity);
+    this.requireExistingRole(input.identity, canManageProject, "Only admins can move project entries.");
     const fromPath = normalizeRelativePath(input.fromRelativePath);
     const toPath = normalizeRelativePath(input.toRelativePath);
     const existing = this.ctx.storage.sql
@@ -253,15 +303,15 @@ export class ProjectRoom extends DurableObject<Env> {
 
   async getShare(access: ProjectAccess): Promise<CollaborationState> {
     const meta = this.requireExistingAccess(access.identity);
-    return this.collaborationState(meta);
+    return this.collaborationState(meta, access.identity);
   }
 
   async createShare(access: ProjectAccess): Promise<CollaborationState> {
-    const meta = this.requireExistingAccess(access.identity);
+    const meta = this.requireExistingRole(access.identity, canManageProject, "Only admins can share this project.");
     const token = meta.shareToken ?? createShareToken(meta.projectId);
-    const nextMeta = { ...meta, shareToken: token };
+    const nextMeta = { ...meta, shareToken: token, defaultRole: meta.defaultRole ?? defaultShareRole };
     this.setMeta("project", nextMeta);
-    return this.collaborationState(nextMeta);
+    return this.collaborationState(nextMeta, access.identity);
   }
 
   async openShare(access: ProjectAccess): Promise<{
@@ -275,22 +325,107 @@ export class ProjectRoom extends DurableObject<Env> {
     });
     return {
       project: this.openProject(meta),
-      collaboration: this.collaborationState(meta),
+      collaboration: this.collaborationState(meta, access.identity),
     };
   }
 
   async updatePresence(input: PresenceInput): Promise<CollaborationState> {
     const meta = this.requireExistingAccess(input.identity);
+    const role = this.roleForIdentity(input.identity, meta);
     this.ctx.storage.sql.exec(
       "INSERT INTO presence (client_id, name, current_file, last_seen) VALUES (?, ?, ?, ?) " +
         "ON CONFLICT(client_id) DO UPDATE SET name = excluded.name, current_file = excluded.current_file, last_seen = excluded.last_seen",
       input.identity.clientId,
-      input.identity.clientName,
+      displayName(input.identity),
       input.currentFile ?? null,
       now(),
     );
     this.prunePresence();
-    return this.collaborationState(meta);
+    this.upsertCollaborator(input.identity, role);
+    return this.collaborationState(meta, input.identity);
+  }
+
+  async getPermissions(access: ProjectAccess): Promise<{
+    permissions: CollaboratorPermission[];
+    isAdmin: boolean;
+    currentUserRole: CollaboratorRole;
+  }> {
+    const meta = this.requireExistingAccess(access.identity);
+    const currentUserRole = this.roleForIdentity(access.identity, meta);
+    return {
+      permissions: this.permissions(access.identity),
+      isAdmin: currentUserRole === "admin",
+      currentUserRole,
+    };
+  }
+
+  async updatePermission(input: PermissionUpdateInput): Promise<CollaboratorPermission> {
+    this.requireExistingRole(input.identity, canManageProject, "Only admins can change permissions.");
+    if (!input.clientId) {
+      throw new Error("Missing collaborator id.");
+    }
+    if (!isCollaboratorRole(input.role)) {
+      throw new Error("Invalid collaborator role.");
+    }
+
+    const target = this.collaboratorByClientId(input.clientId);
+    if (!target || target.revoked) {
+      throw new Error("Collaborator not found.");
+    }
+    if (input.clientId === input.identity.clientId && input.role !== "admin") {
+      throw new Error("Admins cannot remove their own admin access.");
+    }
+    if (target.role === "admin" && input.role !== "admin" && this.activeAdminCount() <= 1) {
+      throw new Error("At least one admin is required.");
+    }
+
+    this.ctx.storage.sql.exec(
+      "UPDATE collaborators SET role = ?, last_seen = ? WHERE client_id = ?",
+      input.role,
+      now(),
+      input.clientId,
+    );
+    this.closeSocketsForRoleChange(input.clientId, input.role);
+    return {
+      clientId: input.clientId,
+      name: target.name,
+      role: input.role,
+      isCurrent: input.clientId === input.identity.clientId,
+    };
+  }
+
+  async removeCollaborator(input: ProjectAccess & { clientId: string }): Promise<void> {
+    const meta = this.requireExistingRole(input.identity, canManageProject, "Only admins can remove collaborators.");
+    if (!input.clientId) {
+      throw new Error("Missing collaborator id.");
+    }
+    if (input.clientId === input.identity.clientId) {
+      throw new Error("Admins cannot remove themselves.");
+    }
+    if (meta.ownerClientId && input.clientId === meta.ownerClientId) {
+      throw new Error("The project owner cannot be removed.");
+    }
+
+    const target = this.collaboratorByClientId(input.clientId);
+    if (!target || target.revoked) {
+      return;
+    }
+    if (target.role === "admin" && this.activeAdminCount() <= 1) {
+      throw new Error("At least one admin is required.");
+    }
+
+    this.ctx.storage.sql.exec(
+      "UPDATE collaborators SET revoked = 1, last_seen = ? WHERE client_id = ?",
+      now(),
+      input.clientId,
+    );
+    this.ctx.storage.sql.exec("DELETE FROM presence WHERE client_id = ?", input.clientId);
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = cfSocket(socket).deserializeAttachment();
+      if (attachment?.clientId === input.clientId) {
+        socket.close(1008, "Project access revoked");
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -298,11 +433,14 @@ export class ProjectRoom extends DurableObject<Env> {
       return new Response("Expected a WebSocket upgrade", { status: 426 });
     }
 
-    const meta = this.requireExistingAccess(identityFromRequest(request));
+    const identity = identityFromRequest(request);
+    const meta = this.requireExistingAccess(identity);
     const url = new URL(request.url);
     const path = normalizeRelativePath(url.searchParams.get("path") ?? "main.tex");
-    const identity = identityFromRequest(request);
-    this.requireAccess(identity, meta);
+    const role = this.requireAccess(identity, meta);
+    if (!canManageProject(role) && !this.fileRow(path)) {
+      throw new Error(`${path} is not a file.`);
+    }
     this.ensureYDoc(path);
 
     const pair = new WebSocketPair();
@@ -312,7 +450,8 @@ export class ProjectRoom extends DurableObject<Env> {
       projectId: meta.projectId,
       path,
       clientId: identity.clientId,
-      clientName: identity.clientName,
+      clientName: displayName(identity),
+      role,
     });
     this.ctx.acceptWebSocket(server);
     this.updatePresence({ identity, currentFile: path });
@@ -340,6 +479,25 @@ export class ProjectRoom extends DurableObject<Env> {
     const messageType = decoding.readVarUint(decoder);
 
     if (messageType === messageSync) {
+      const role = this.roleForClientId(attachment.clientId);
+      if (!role) {
+        socket.close(1008, "Project access revoked");
+        return;
+      }
+      if (!canEditContent(role)) {
+        const innerMessageType = decoding.readVarUint(decoder);
+        if (innerMessageType !== syncProtocol.messageYjsSyncStep1) {
+          socket.close(1008, "This project is read-only for you.");
+          return;
+        }
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, messageSync);
+        syncProtocol.readSyncStep1(decoder, encoder, doc);
+        if (encoding.length(encoder) > 1) {
+          socket.send(encoding.toUint8Array(encoder));
+        }
+        return;
+      }
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
       syncProtocol.readSyncMessage(decoder, encoder, doc, socket);
@@ -383,6 +541,17 @@ export class ProjectRoom extends DurableObject<Env> {
         current_file TEXT,
         last_seen INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS collaborators (
+        client_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'editor', 'viewer')),
+        joined_at INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS collaborators_active_role_idx
+        ON collaborators (revoked, role);
     `);
   }
 
@@ -411,14 +580,123 @@ export class ProjectRoom extends DurableObject<Env> {
     return meta;
   }
 
-  private requireAccess(identity: RequestIdentity, meta: ProjectMeta): void {
+  private requireExistingRole(
+    identity: RequestIdentity,
+    allow: (role: CollaboratorRole) => boolean,
+    message: string,
+  ): ProjectMeta {
+    const meta = this.requireExistingAccess(identity);
+    const role = this.roleForIdentity(identity, meta);
+    if (!allow(role)) {
+      throw new Error(message);
+    }
+    return meta;
+  }
+
+  private requireAccess(identity: RequestIdentity, meta: ProjectMeta): CollaboratorRole {
+    return this.roleForIdentity(identity, meta);
+  }
+
+  private roleForIdentity(identity: RequestIdentity, meta: ProjectMeta): CollaboratorRole {
     if (identity.sessionId === meta.ownerSessionId) {
-      return;
+      if (!meta.ownerClientId) {
+        this.setMeta("project", { ...meta, ownerClientId: identity.clientId });
+      }
+      return this.upsertCollaborator(identity, "admin", true);
     }
     if (meta.shareToken && identity.shareToken === meta.shareToken) {
-      return;
+      return this.upsertCollaborator(identity, meta.defaultRole ?? defaultShareRole);
     }
     throw new Error("You do not have access to this project.");
+  }
+
+  private upsertCollaborator(
+    identity: RequestIdentity,
+    fallbackRole: CollaboratorRole,
+    forceRole = false,
+  ): CollaboratorRole {
+    const existing = this.collaboratorByClientId(identity.clientId);
+    if (existing?.revoked && !forceRole) {
+      throw new Error("Your access to this project was revoked.");
+    }
+    const role = forceRole ? fallbackRole : existing?.role ?? fallbackRole;
+    const name = displayName(identity);
+    const timestamp = now();
+
+    if (existing) {
+      this.ctx.storage.sql.exec(
+        "UPDATE collaborators SET session_id = ?, name = ?, role = ?, last_seen = ?, revoked = 0 WHERE client_id = ?",
+        identity.sessionId,
+        name,
+        role,
+        timestamp,
+        identity.clientId,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO collaborators (client_id, session_id, name, role, joined_at, last_seen, revoked) VALUES (?, ?, ?, ?, ?, ?, 0)",
+        identity.clientId,
+        identity.sessionId,
+        name,
+        role,
+        timestamp,
+        timestamp,
+      );
+    }
+
+    return role;
+  }
+
+  private collaboratorByClientId(clientId: string): CollaboratorRow | null {
+    const row = this.ctx.storage.sql
+      .exec<CollaboratorRow>(
+        "SELECT client_id, session_id, name, role, joined_at, last_seen, revoked FROM collaborators WHERE client_id = ?",
+        clientId,
+      )
+      .toArray()[0];
+    return row ?? null;
+  }
+
+  private roleForClientId(clientId: string): CollaboratorRole | null {
+    const collaborator = this.collaboratorByClientId(clientId);
+    if (!collaborator || collaborator.revoked) {
+      return null;
+    }
+    return collaborator.role;
+  }
+
+  private activeAdminCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM collaborators WHERE revoked = 0 AND role = 'admin'",
+      )
+      .one().count;
+  }
+
+  private permissions(identity: RequestIdentity): CollaboratorPermission[] {
+    return this.ctx.storage.sql
+      .exec<CollaboratorRow>(
+        "SELECT client_id, session_id, name, role, joined_at, last_seen, revoked FROM collaborators WHERE revoked = 0 ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END, name",
+      )
+      .toArray()
+      .map((row) => ({
+        clientId: row.client_id,
+        name: row.name,
+        role: row.role,
+        ...(row.client_id === identity.clientId ? { isCurrent: true } : {}),
+      }));
+  }
+
+  private closeSocketsForRoleChange(clientId: string, role: CollaboratorRole): void {
+    if (canEditContent(role)) {
+      return;
+    }
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = cfSocket(socket).deserializeAttachment();
+      if (attachment?.clientId === clientId) {
+        socket.close(1008, "This project is read-only for you.");
+      }
+    }
   }
 
   private openProject(meta: ProjectMeta): OpenProject {
@@ -433,13 +711,18 @@ export class ProjectRoom extends DurableObject<Env> {
     return `cloud://latexdo/${meta.projectId}/${encodeURIComponent(meta.name)}`;
   }
 
-  private collaborationState(meta: ProjectMeta): CollaborationState {
+  private collaborationState(
+    meta: ProjectMeta,
+    identity?: RequestIdentity,
+  ): CollaborationState {
+    const currentUserRole = identity ? this.roleForIdentity(identity, meta) : undefined;
     return {
       enabled: Boolean(meta.shareToken),
       token: meta.shareToken,
       projectId: meta.projectId,
       projectName: meta.name,
       users: this.presenceUsers(),
+      ...(currentUserRole ? { currentUserRole, isAdmin: currentUserRole === "admin" } : {}),
     };
   }
 
@@ -451,8 +734,11 @@ export class ProjectRoom extends DurableObject<Env> {
         name: string;
         current_file: string | null;
         last_seen: number;
+        role: CollaboratorRole | null;
       }>(
-        "SELECT client_id, name, current_file, last_seen FROM presence ORDER BY name",
+        "SELECT presence.client_id, presence.name, presence.current_file, presence.last_seen, collaborators.role " +
+          "FROM presence LEFT JOIN collaborators ON collaborators.client_id = presence.client_id AND collaborators.revoked = 0 " +
+          "ORDER BY presence.name",
       )
       .toArray()
       .map((row) => ({
@@ -460,6 +746,7 @@ export class ProjectRoom extends DurableObject<Env> {
         name: row.name,
         currentFile: row.current_file,
         lastSeen: row.last_seen,
+        role: row.role ?? "viewer",
       }));
   }
 
@@ -485,12 +772,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private readFileContent(path: string): string {
-    const row = this.ctx.storage.sql
-      .exec<FileRow>(
-        "SELECT path, type, content, y_update FROM files WHERE path = ?",
-        path,
-      )
-      .toArray()[0];
+    const row = this.fileRow(path);
     if (!row || row.type !== "file") {
       throw new Error(`${path} is not a file.`);
     }
@@ -509,18 +791,23 @@ export class ProjectRoom extends DurableObject<Env> {
     );
   }
 
-  private ensureYDoc(path: string): Y.Doc {
-    const existing = this.docs.get(path);
-    if (existing) {
-      return existing;
-    }
-
+  private fileRow(path: string): FileRow | null {
     const row = this.ctx.storage.sql
       .exec<FileRow>(
         "SELECT path, type, content, y_update FROM files WHERE path = ?",
         path,
       )
       .toArray()[0];
+    return row ?? null;
+  }
+
+  private ensureYDoc(path: string): Y.Doc {
+    const existing = this.docs.get(path);
+    if (existing) {
+      return existing;
+    }
+
+    const row = this.fileRow(path);
     if (!row || row.type !== "file") {
       this.writeFileContent(path, starterContent(path));
     }

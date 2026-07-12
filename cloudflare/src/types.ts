@@ -10,6 +10,8 @@ export interface RequestIdentity {
   shareToken?: string;
 }
 
+export type CollaboratorRole = "admin" | "editor" | "viewer";
+
 export interface OpenProject {
   id: string;
   rootPath: string;
@@ -29,6 +31,7 @@ export interface CollaboratorPresence {
   name: string;
   currentFile: string | null;
   lastSeen: number;
+  role?: CollaboratorRole;
 }
 
 export interface CollaborationState {
@@ -38,10 +41,24 @@ export interface CollaborationState {
   projectId?: string;
   projectName?: string;
   users: CollaboratorPresence[];
+  currentUserRole?: CollaboratorRole;
+  isAdmin?: boolean;
 }
 
 export interface ProjectAccess {
   identity: RequestIdentity;
+}
+
+export interface CollaboratorPermission {
+  clientId: string;
+  name: string;
+  role: CollaboratorRole;
+  isCurrent?: boolean;
+}
+
+export interface PermissionUpdateInput extends ProjectAccess {
+  clientId: string;
+  role: CollaboratorRole;
 }
 
 export interface InitProjectInput extends ProjectAccess {
@@ -68,4 +85,5 @@ export interface WebSocketAttachment {
   path: string;
   clientId: string;
   clientName: string;
+  role: CollaboratorRole;
 }

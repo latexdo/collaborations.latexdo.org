@@ -2,7 +2,7 @@ import { corsHeaders, identityFromRequest } from "./auth";
 import { emptyResponse, errorResponse, jsonResponse } from "./database";
 import { defaultProjectIdForSession, projectIdFromShareToken, randomId } from "./tokens";
 import type { ProjectRoom } from "./project-room";
-import type { Env, ProjectAccess } from "./types";
+import type { CollaboratorRole, Env, ProjectAccess } from "./types";
 
 function roomFor(env: Env, projectId: string): DurableObjectStub<ProjectRoom> {
   return env.PROJECT_ROOM.getByName(projectId) as DurableObjectStub<ProjectRoom>;
@@ -27,6 +27,13 @@ function filePath(url: URL): string {
 
 function access(request: Request): ProjectAccess {
   return { identity: identityFromRequest(request) };
+}
+
+function collaboratorRole(value: unknown): CollaboratorRole {
+  if (value === "admin" || value === "editor" || value === "viewer") {
+    return value;
+  }
+  throw new Error("Invalid collaborator role.");
 }
 
 async function handleProjectFiles(
@@ -142,7 +149,7 @@ async function handleProjects(
   }
 
   if (segments[2] === "files") {
-    return handleProjectFiles(request, env, projectId, segments.slice(3));
+    return await handleProjectFiles(request, env, projectId, segments.slice(3));
   }
 
   if (segments[2] === "share") {
@@ -197,6 +204,38 @@ async function handleShares(
     return jsonResponse(request, env, state);
   }
 
+  if (segments[2] === "permissions") {
+    if (request.method === "GET") {
+      const state = await room.getPermissions(projectAccess);
+      return jsonResponse(request, env, state);
+    }
+
+    if (request.method === "PUT") {
+      const body = await readJsonBody<{
+        clientId?: string;
+        role?: string;
+      }>(request);
+      const permission = await room.updatePermission({
+        ...projectAccess,
+        clientId: String(body.clientId ?? ""),
+        role: collaboratorRole(body.role),
+      });
+      return jsonResponse(request, env, permission);
+    }
+  }
+
+  if (
+    segments[2] === "collaborators" &&
+    segments[3] &&
+    request.method === "DELETE"
+  ) {
+    await room.removeCollaborator({
+      ...projectAccess,
+      clientId: decodeURIComponent(segments[3]),
+    });
+    return emptyResponse(request, env, { status: 204 });
+  }
+
   return errorResponse(request, env, "Not found", 404);
 }
 
@@ -236,18 +275,25 @@ export async function routeRequest(
     }
 
     if (segments[0] === "api" && segments[1] === "projects") {
-      return handleProjects(request, env, segments.slice(1));
+      return await handleProjects(request, env, segments.slice(1));
     }
 
     if (segments[0] === "api" && segments[1] === "shares") {
-      return handleShares(request, env, segments.slice(1));
+      return await handleShares(request, env, segments.slice(1));
     }
 
     return errorResponse(request, env, "Not found", 404);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Internal server error";
     const status =
-      message.includes("access") || message.includes("share token") ? 403 : 400;
+      message.includes("access") ||
+      message.includes("share token") ||
+      message.includes("permission") ||
+      message.includes("Only admins") ||
+      message.includes("read-only") ||
+      message.includes("revoked")
+        ? 403
+        : 400;
     console.error(
       JSON.stringify({
         level: "error",

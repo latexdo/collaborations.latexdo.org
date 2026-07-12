@@ -17,3 +17,16 @@ CREATE TABLE IF NOT EXISTS presence (
   current_file TEXT,
   last_seen INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS collaborators (
+  client_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'editor', 'viewer')),
+  joined_at INTEGER NOT NULL,
+  last_seen INTEGER NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS collaborators_active_role_idx
+  ON collaborators (revoked, role);
