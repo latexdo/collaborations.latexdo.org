@@ -217,6 +217,20 @@ export async function routeRequest(
   const segments = pathSegments(url);
 
   try {
+    if (url.pathname === "/") {
+      return jsonResponse(request, env, {
+        ok: true,
+        service: "LatexDo collaboration API",
+        endpoints: {
+          health: "/health",
+          openProject: "POST /api/projects/open",
+          createProject: "POST /api/projects",
+          files: "/api/projects/:projectId/files",
+          shares: "/api/shares/:token/open",
+        },
+      });
+    }
+
     if (url.pathname === "/health") {
       return jsonResponse(request, env, { ok: true });
     }

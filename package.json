@@ -3,12 +3,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm --prefix cloudflare ci && npm --prefix cloudflare run typecheck",
+    "build": "tsc -p cloudflare/tsconfig.json --noEmit",
     "dev": "npm --prefix cloudflare run dev",
     "deploy": "npx wrangler deploy",
-    "typecheck": "npm --prefix cloudflare run typecheck"
+    "typecheck": "tsc -p cloudflare/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "lib0": "^0.2.117",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.31"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260712.1",
+    "typescript": "^7.0.2",
     "wrangler": "^4.110.0"
   }
 }
