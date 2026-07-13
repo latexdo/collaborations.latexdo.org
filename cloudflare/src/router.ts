@@ -1,6 +1,11 @@
 import { corsHeaders, identityFromRequest } from "./auth";
 import { emptyResponse, errorResponse, jsonResponse } from "./database";
-import { defaultProjectIdForSession, projectIdFromShareToken, randomId } from "./tokens";
+import {
+  defaultProjectIdForSession,
+  projectIdFromShareToken,
+  randomId,
+  shareTokenFromInput,
+} from "./tokens";
 import type { ProjectRoom } from "./project-room";
 import type { CollaboratorRole, Env, ProjectAccess } from "./types";
 
@@ -26,7 +31,15 @@ function filePath(url: URL): string {
 }
 
 function access(request: Request): ProjectAccess {
-  return { identity: identityFromRequest(request) };
+  const identity = identityFromRequest(request);
+  return {
+    identity: {
+      ...identity,
+      shareToken: identity.shareToken
+        ? shareTokenFromInput(identity.shareToken)
+        : undefined,
+    },
+  };
 }
 
 function collaboratorRole(value: unknown): CollaboratorRole {
@@ -172,7 +185,7 @@ async function handleShares(
   env: Env,
   segments: string[],
 ): Promise<Response> {
-  const token = segments[1];
+  const token = shareTokenFromInput(segments[1] ?? "");
   if (!token) {
     return errorResponse(request, env, "Missing share token", 400);
   }

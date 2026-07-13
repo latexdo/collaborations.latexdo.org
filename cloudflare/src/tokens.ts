@@ -26,12 +26,40 @@ export function createShareToken(projectId: string): string {
   return `${projectId}.${randomSecret()}`;
 }
 
+function decodeTokenInput(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+export function shareTokenFromInput(input: string): string {
+  const value = input.trim();
+  if (!value) {
+    return "";
+  }
+
+  const decodedValue = decodeTokenInput(value).trim();
+  try {
+    const url = new URL(decodedValue);
+    return (
+      url.searchParams.get("share")?.trim() ||
+      url.searchParams.get("token")?.trim() ||
+      decodedValue
+    );
+  } catch {
+    return decodedValue;
+  }
+}
+
 export function projectIdFromShareToken(token: string): string | null {
-  const separator = token.indexOf(".");
+  const shareToken = shareTokenFromInput(token);
+  const separator = shareToken.indexOf(".");
   if (separator <= 0) {
     return null;
   }
-  const projectId = token.slice(0, separator);
+  const projectId = shareToken.slice(0, separator);
   return /^[a-z0-9_:-]{6,128}$/i.test(projectId) ? projectId : null;
 }
 
