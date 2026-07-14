@@ -80,10 +80,16 @@ export interface PresenceInput extends ProjectAccess {
   currentFile?: string | null;
 }
 
+export interface AwarenessClientState {
+  clientId: number;
+  clock: number;
+}
+
 export interface WebSocketAttachment {
   projectId: string;
   path: string;
   clientId: string;
   clientName: string;
   role: CollaboratorRole;
+  awarenessClientStates?: AwarenessClientState[];
 }

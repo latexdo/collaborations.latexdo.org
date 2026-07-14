@@ -66,6 +66,10 @@ type AttachmentWebSocket = WebSocket & {
   deserializeAttachment(): WebSocketAttachment | undefined;
 };
 
+type AwarenessClientStates = NonNullable<
+  WebSocketAttachment["awarenessClientStates"]
+>;
+
 function now(): number {
   return Date.now();
 }
@@ -126,6 +130,56 @@ function cfSocket(socket: WebSocket): AttachmentWebSocket {
   return socket as AttachmentWebSocket;
 }
 
+function readAwarenessClientStates(
+  update: Uint8Array,
+): AwarenessClientStates | null {
+  try {
+    const decoder = decoding.createDecoder(update);
+    const length = decoding.readVarUint(decoder);
+    const states: AwarenessClientStates = [];
+    for (let index = 0; index < length; index += 1) {
+      const clientId = decoding.readVarUint(decoder);
+      const clock = decoding.readVarUint(decoder);
+      decoding.readVarString(decoder);
+      states.push({ clientId, clock });
+    }
+    return states;
+  } catch {
+    return null;
+  }
+}
+
+function mergeAwarenessClientStates(
+  current: AwarenessClientStates | undefined,
+  incoming: AwarenessClientStates,
+): AwarenessClientStates {
+  const merged = new Map<number, number>();
+  for (const state of current ?? []) {
+    merged.set(state.clientId, state.clock);
+  }
+  for (const state of incoming) {
+    merged.set(
+      state.clientId,
+      Math.max(merged.get(state.clientId) ?? 0, state.clock),
+    );
+  }
+  return [...merged.entries()].map(([clientId, clock]) => ({
+    clientId,
+    clock,
+  }));
+}
+
+function awarenessRemovalUpdate(states: AwarenessClientStates): Uint8Array {
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, states.length);
+  for (const state of states) {
+    encoding.writeVarUint(encoder, state.clientId);
+    encoding.writeVarUint(encoder, state.clock + 1);
+    encoding.writeVarString(encoder, "null");
+  }
+  return encoding.toUint8Array(encoder);
+}
+
 export class ProjectRoom extends DurableObject<Env> {
   private docs = new Map<string, Y.Doc>();
 
@@ -171,9 +225,10 @@ export class ProjectRoom extends DurableObject<Env> {
   async listFiles(access: ProjectAccess): Promise<ProjectEntry[]> {
     const meta = this.requireExistingAccess(access.identity);
     const rows = this.ctx.storage.sql
-      .exec<{ path: string; type: "file" | "directory" }>(
-        "SELECT path, type FROM files ORDER BY path",
-      )
+      .exec<{
+        path: string;
+        type: "file" | "directory";
+      }>("SELECT path, type FROM files ORDER BY path")
       .toArray();
     return entriesToTree(rows, this.projectRoot(meta));
   }
@@ -189,7 +244,11 @@ export class ProjectRoom extends DurableObject<Env> {
   async writeFile(
     access: ProjectAccess & { relativePath: string; content: string },
   ): Promise<void> {
-    const meta = this.requireExistingRole(access.identity, canEditContent, "This project is read-only for you.");
+    const meta = this.requireExistingRole(
+      access.identity,
+      canEditContent,
+      "This project is read-only for you.",
+    );
     const role = this.roleForIdentity(access.identity, meta);
     const path = normalizeRelativePath(access.relativePath);
     if (!canManageProject(role) && !this.fileRow(path)) {
@@ -215,17 +274,27 @@ export class ProjectRoom extends DurableObject<Env> {
     this.requireExistingAccess(access.identity);
     const path = normalizeRelativePath(access.relativePath);
     const row = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) as count FROM files WHERE path = ?", path)
+      .exec<{
+        count: number;
+      }>("SELECT COUNT(*) as count FROM files WHERE path = ?", path)
       .one();
     return { exists: row.count > 0 };
   }
 
-  async createEntry(input: CreateEntryInput): Promise<{ relativePath: string }> {
-    this.requireExistingRole(input.identity, canManageProject, "Only admins can create files or folders.");
+  async createEntry(
+    input: CreateEntryInput,
+  ): Promise<{ relativePath: string }> {
+    this.requireExistingRole(
+      input.identity,
+      canManageProject,
+      "Only admins can create files or folders.",
+    );
     const path = normalizeRelativePath(input.relativePath);
     const type = input.type;
     const exists = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) as count FROM files WHERE path = ?", path)
+      .exec<{
+        count: number;
+      }>("SELECT COUNT(*) as count FROM files WHERE path = ?", path)
       .one().count;
     if (exists) {
       throw new Error(`${path} already exists.`);
@@ -243,20 +312,26 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   async moveEntry(input: MoveEntryInput): Promise<{ relativePath: string }> {
-    this.requireExistingRole(input.identity, canManageProject, "Only admins can move project entries.");
+    this.requireExistingRole(
+      input.identity,
+      canManageProject,
+      "Only admins can move project entries.",
+    );
     const fromPath = normalizeRelativePath(input.fromRelativePath);
     const toPath = normalizeRelativePath(input.toRelativePath);
     const existing = this.ctx.storage.sql
-      .exec<{ path: string; type: "file" | "directory" }>(
-        "SELECT path, type FROM files WHERE path = ?",
-        fromPath,
-      )
+      .exec<{
+        path: string;
+        type: "file" | "directory";
+      }>("SELECT path, type FROM files WHERE path = ?", fromPath)
       .toArray()[0];
     if (!existing) {
       throw new Error(`${fromPath} does not exist.`);
     }
     const targetExists = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) as count FROM files WHERE path = ?", toPath)
+      .exec<{
+        count: number;
+      }>("SELECT COUNT(*) as count FROM files WHERE path = ?", toPath)
       .one().count;
     if (targetExists) {
       throw new Error(`${toPath} already exists.`);
@@ -307,9 +382,17 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   async createShare(access: ProjectAccess): Promise<CollaborationState> {
-    const meta = this.requireExistingRole(access.identity, canManageProject, "Only admins can share this project.");
+    const meta = this.requireExistingRole(
+      access.identity,
+      canManageProject,
+      "Only admins can share this project.",
+    );
     const token = meta.shareToken ?? createShareToken(meta.projectId);
-    const nextMeta = { ...meta, shareToken: token, defaultRole: meta.defaultRole ?? defaultShareRole };
+    const nextMeta = {
+      ...meta,
+      shareToken: token,
+      defaultRole: meta.defaultRole ?? defaultShareRole,
+    };
     this.setMeta("project", nextMeta);
     return this.collaborationState(nextMeta, access.identity);
   }
@@ -359,8 +442,14 @@ export class ProjectRoom extends DurableObject<Env> {
     };
   }
 
-  async updatePermission(input: PermissionUpdateInput): Promise<CollaboratorPermission> {
-    this.requireExistingRole(input.identity, canManageProject, "Only admins can change permissions.");
+  async updatePermission(
+    input: PermissionUpdateInput,
+  ): Promise<CollaboratorPermission> {
+    this.requireExistingRole(
+      input.identity,
+      canManageProject,
+      "Only admins can change permissions.",
+    );
     if (!input.clientId) {
       throw new Error("Missing collaborator id.");
     }
@@ -375,7 +464,11 @@ export class ProjectRoom extends DurableObject<Env> {
     if (input.clientId === input.identity.clientId && input.role !== "admin") {
       throw new Error("Admins cannot remove their own admin access.");
     }
-    if (target.role === "admin" && input.role !== "admin" && this.activeAdminCount() <= 1) {
+    if (
+      target.role === "admin" &&
+      input.role !== "admin" &&
+      this.activeAdminCount() <= 1
+    ) {
       throw new Error("At least one admin is required.");
     }
 
@@ -394,8 +487,14 @@ export class ProjectRoom extends DurableObject<Env> {
     };
   }
 
-  async removeCollaborator(input: ProjectAccess & { clientId: string }): Promise<void> {
-    const meta = this.requireExistingRole(input.identity, canManageProject, "Only admins can remove collaborators.");
+  async removeCollaborator(
+    input: ProjectAccess & { clientId: string },
+  ): Promise<void> {
+    const meta = this.requireExistingRole(
+      input.identity,
+      canManageProject,
+      "Only admins can remove collaborators.",
+    );
     if (!input.clientId) {
       throw new Error("Missing collaborator id.");
     }
@@ -419,10 +518,14 @@ export class ProjectRoom extends DurableObject<Env> {
       now(),
       input.clientId,
     );
-    this.ctx.storage.sql.exec("DELETE FROM presence WHERE client_id = ?", input.clientId);
+    this.ctx.storage.sql.exec(
+      "DELETE FROM presence WHERE client_id = ?",
+      input.clientId,
+    );
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = cfSocket(socket).deserializeAttachment();
       if (attachment?.clientId === input.clientId) {
+        this.broadcastAwarenessRemoval(socket, attachment);
         socket.close(1008, "Project access revoked");
       }
     }
@@ -436,7 +539,9 @@ export class ProjectRoom extends DurableObject<Env> {
     const identity = identityFromRequest(request);
     const meta = this.requireExistingAccess(identity);
     const url = new URL(request.url);
-    const path = normalizeRelativePath(url.searchParams.get("path") ?? "main.tex");
+    const path = normalizeRelativePath(
+      url.searchParams.get("path") ?? "main.tex",
+    );
     const role = this.requireAccess(identity, meta);
     if (!canManageProject(role) && !this.fileRow(path)) {
       throw new Error(`${path} is not a file.`);
@@ -463,8 +568,14 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(
+    socket: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
     if (typeof message === "string") {
+      return;
+    }
+    if (message.byteLength === 0) {
       return;
     }
 
@@ -475,8 +586,15 @@ export class ProjectRoom extends DurableObject<Env> {
     }
 
     const doc = this.ensureYDoc(attachment.path);
-    const decoder = decoding.createDecoder(new Uint8Array(message));
-    const messageType = decoding.readVarUint(decoder);
+    const bytes = new Uint8Array(message);
+    let decoder: decoding.Decoder;
+    let messageType: number;
+    try {
+      decoder = decoding.createDecoder(bytes);
+      messageType = decoding.readVarUint(decoder);
+    } catch {
+      return;
+    }
 
     if (messageType === messageSync) {
       const role = this.roleForClientId(attachment.clientId);
@@ -485,14 +603,23 @@ export class ProjectRoom extends DurableObject<Env> {
         return;
       }
       if (!canEditContent(role)) {
-        const innerMessageType = decoding.readVarUint(decoder);
+        let innerMessageType: number;
+        try {
+          innerMessageType = decoding.readVarUint(decoder);
+        } catch {
+          return;
+        }
         if (innerMessageType !== syncProtocol.messageYjsSyncStep1) {
           socket.close(1008, "This project is read-only for you.");
           return;
         }
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, messageSync);
-        syncProtocol.readSyncStep1(decoder, encoder, doc);
+        try {
+          syncProtocol.readSyncStep1(decoder, encoder, doc);
+        } catch {
+          return;
+        }
         if (encoding.length(encoder) > 1) {
           socket.send(encoding.toUint8Array(encoder));
         }
@@ -500,22 +627,53 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
-      syncProtocol.readSyncMessage(decoder, encoder, doc, socket);
+      try {
+        syncProtocol.readSyncMessage(decoder, encoder, doc, socket);
+      } catch {
+        return;
+      }
       if (encoding.length(encoder) > 1) {
         socket.send(encoding.toUint8Array(encoder));
       }
       return;
     }
 
-    if (messageType === messageAwareness || messageType === messageQueryAwareness) {
-      this.broadcastToFile(attachment.path, new Uint8Array(message), socket);
+    if (
+      messageType === messageAwareness ||
+      messageType === messageQueryAwareness
+    ) {
+      if (messageType === messageAwareness) {
+        let update: Uint8Array;
+        try {
+          if (!decoding.hasContent(decoder)) return;
+          update = decoding.readVarUint8Array(decoder);
+        } catch {
+          return;
+        }
+        const clientStates = readAwarenessClientStates(update);
+        if (clientStates === null) {
+          return;
+        }
+        cfSocket(socket).serializeAttachment({
+          ...attachment,
+          awarenessClientStates: mergeAwarenessClientStates(
+            attachment.awarenessClientStates,
+            clientStates,
+          ),
+        });
+      }
+      this.broadcastToFile(attachment.path, bytes, socket);
     }
   }
 
   async webSocketClose(socket: WebSocket): Promise<void> {
     const attachment = cfSocket(socket).deserializeAttachment();
     if (!attachment) return;
-    this.ctx.storage.sql.exec("DELETE FROM presence WHERE client_id = ?", attachment.clientId);
+    this.broadcastAwarenessRemoval(socket, attachment);
+    this.ctx.storage.sql.exec(
+      "DELETE FROM presence WHERE client_id = ?",
+      attachment.clientId,
+    );
   }
 
   async webSocketError(socket: WebSocket): Promise<void> {
@@ -557,7 +715,9 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private getProjectMeta(): ProjectMeta | null {
     const row = this.ctx.storage.sql
-      .exec<{ value: string }>("SELECT value FROM project_meta WHERE key = 'project'")
+      .exec<{
+        value: string;
+      }>("SELECT value FROM project_meta WHERE key = 'project'")
       .toArray()[0];
     return safeJsonParse<ProjectMeta>(row?.value ?? null);
   }
@@ -593,11 +753,17 @@ export class ProjectRoom extends DurableObject<Env> {
     return meta;
   }
 
-  private requireAccess(identity: RequestIdentity, meta: ProjectMeta): CollaboratorRole {
+  private requireAccess(
+    identity: RequestIdentity,
+    meta: ProjectMeta,
+  ): CollaboratorRole {
     return this.roleForIdentity(identity, meta);
   }
 
-  private roleForIdentity(identity: RequestIdentity, meta: ProjectMeta): CollaboratorRole {
+  private roleForIdentity(
+    identity: RequestIdentity,
+    meta: ProjectMeta,
+  ): CollaboratorRole {
     if (identity.sessionId === meta.ownerSessionId) {
       if (!meta.ownerClientId) {
         this.setMeta("project", { ...meta, ownerClientId: identity.clientId });
@@ -605,7 +771,10 @@ export class ProjectRoom extends DurableObject<Env> {
       return this.upsertCollaborator(identity, "admin", true);
     }
     if (meta.shareToken && identity.shareToken === meta.shareToken) {
-      return this.upsertCollaborator(identity, meta.defaultRole ?? defaultShareRole);
+      return this.upsertCollaborator(
+        identity,
+        meta.defaultRole ?? defaultShareRole,
+      );
     }
     throw new Error("You do not have access to this project.");
   }
@@ -619,7 +788,7 @@ export class ProjectRoom extends DurableObject<Env> {
     if (existing?.revoked && !forceRole) {
       throw new Error("Your access to this project was revoked.");
     }
-    const role = forceRole ? fallbackRole : existing?.role ?? fallbackRole;
+    const role = forceRole ? fallbackRole : (existing?.role ?? fallbackRole);
     const name = displayName(identity);
     const timestamp = now();
 
@@ -667,9 +836,9 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private activeAdminCount(): number {
     return this.ctx.storage.sql
-      .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM collaborators WHERE revoked = 0 AND role = 'admin'",
-      )
+      .exec<{
+        count: number;
+      }>("SELECT COUNT(*) as count FROM collaborators WHERE revoked = 0 AND role = 'admin'")
       .one().count;
   }
 
@@ -687,7 +856,10 @@ export class ProjectRoom extends DurableObject<Env> {
       }));
   }
 
-  private closeSocketsForRoleChange(clientId: string, role: CollaboratorRole): void {
+  private closeSocketsForRoleChange(
+    clientId: string,
+    role: CollaboratorRole,
+  ): void {
     if (canEditContent(role)) {
       return;
     }
@@ -715,14 +887,18 @@ export class ProjectRoom extends DurableObject<Env> {
     meta: ProjectMeta,
     identity?: RequestIdentity,
   ): CollaborationState {
-    const currentUserRole = identity ? this.roleForIdentity(identity, meta) : undefined;
+    const currentUserRole = identity
+      ? this.roleForIdentity(identity, meta)
+      : undefined;
     return {
       enabled: Boolean(meta.shareToken),
       token: meta.shareToken,
       projectId: meta.projectId,
       projectName: meta.name,
       users: this.presenceUsers(),
-      ...(currentUserRole ? { currentUserRole, isAdmin: currentUserRole === "admin" } : {}),
+      ...(currentUserRole
+        ? { currentUserRole, isAdmin: currentUserRole === "admin" }
+        : {}),
     };
   }
 
@@ -879,5 +1055,23 @@ export class ProjectRoom extends DurableObject<Env> {
         socket.close(1011, "Unable to send collaboration update");
       }
     }
+  }
+
+  private broadcastAwarenessRemoval(
+    socket: WebSocket,
+    attachment: WebSocketAttachment,
+  ): void {
+    const states = attachment.awarenessClientStates ?? [];
+    if (!states.length) {
+      return;
+    }
+    const encoder = encoding.createEncoder();
+    encoding.writeVarUint(encoder, messageAwareness);
+    encoding.writeVarUint8Array(encoder, awarenessRemovalUpdate(states));
+    this.broadcastToFile(
+      attachment.path,
+      encoding.toUint8Array(encoder),
+      socket,
+    );
   }
 }
