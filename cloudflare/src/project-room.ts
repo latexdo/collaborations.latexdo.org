@@ -764,7 +764,11 @@ export class ProjectRoom extends DurableObject<Env> {
     identity: RequestIdentity,
     meta: ProjectMeta,
   ): CollaboratorRole {
-    if (identity.sessionId === meta.ownerSessionId) {
+    if (
+      identity.sessionId === meta.ownerSessionId ||
+      (meta.ownerClientId !== undefined &&
+        identity.clientId === meta.ownerClientId)
+    ) {
       if (!meta.ownerClientId) {
         this.setMeta("project", { ...meta, ownerClientId: identity.clientId });
       }
@@ -838,7 +842,9 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.storage.sql
       .exec<{
         count: number;
-      }>("SELECT COUNT(*) as count FROM collaborators WHERE revoked = 0 AND role = 'admin'")
+      }>(
+        "SELECT COUNT(*) as count FROM collaborators WHERE revoked = 0 AND role = 'admin'",
+      )
       .one().count;
   }
 
