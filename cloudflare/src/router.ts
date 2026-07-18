@@ -165,6 +165,15 @@ async function handleProjects(
     return await handleProjectFiles(request, env, projectId, segments.slice(3));
   }
 
+  if (segments[2] === "share" && segments[3] === "rotate") {
+    if (request.method === "POST") {
+      const room = roomFor(env, projectId);
+      const state = await room.rotateShare(access(request));
+      return jsonResponse(request, env, state);
+    }
+    return errorResponse(request, env, "Method not allowed", 405);
+  }
+
   if (segments[2] === "share") {
     const room = roomFor(env, projectId);
     if (request.method === "GET") {

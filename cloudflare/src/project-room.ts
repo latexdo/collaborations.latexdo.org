@@ -397,6 +397,21 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.collaborationState(nextMeta, access.identity);
   }
 
+  async rotateShare(access: ProjectAccess): Promise<CollaborationState> {
+    const meta = this.requireExistingRole(
+      access.identity,
+      canManageProject,
+      "Only admins can regenerate this share link.",
+    );
+    const nextMeta = {
+      ...meta,
+      shareToken: createShareToken(meta.projectId),
+      defaultRole: meta.defaultRole ?? defaultShareRole,
+    };
+    this.setMeta("project", nextMeta);
+    return this.collaborationState(nextMeta, access.identity);
+  }
+
   async openShare(access: ProjectAccess): Promise<{
     project: OpenProject;
     collaboration: CollaborationState;
